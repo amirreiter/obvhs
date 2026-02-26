@@ -82,7 +82,6 @@ impl Debug for CwBvhNode {
 pub(crate) const EPSILON: f32 = 0.0001;
 
 impl CwBvhNode {
-    #[inline(always)]
     pub fn intersect_ray(&self, ray: &Ray, oct_inv4: u32) -> u32 {
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
@@ -92,9 +91,17 @@ impl CwBvhNode {
             self.intersect_ray_simd(ray, oct_inv4)
         }
 
-        #[cfg(not(all(
-            any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "sse2"
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            self.intersect_ray_simd(ray, oct_inv4)
+        }
+
+        #[cfg(not(any(
+            all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature = "sse2"
+            ),
+            all(target_arch = "aarch64", target_feature = "neon")
         )))]
         {
             self.intersect_ray_basic(ray, oct_inv4)
