@@ -8,15 +8,12 @@ use std::arch::x86_64::*;
 use core::arch::aarch64::*;
 
 use crate::{
-    cwbvh::{CwBvhNode, node::EPSILON},
+    cwbvh::{
+        CwBvhNode,
+        node::{EPSILON, extract_byte64},
+    },
     ray::Ray,
 };
-
-#[cfg(all(
-    any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "sse2"
-))]
-use crate::cwbvh::node::extract_byte64;
 
 impl CwBvhNode {
     #[cfg(all(
@@ -109,25 +106,14 @@ impl CwBvhNode {
         hit_mask
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     #[inline(always)]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     pub fn intersect_ray_simd(&self, ray: &Ray, oct_inv4: u32) -> u32 {
+        let adj_ray_dir_inv = self.compute_extent() * ray.inv_direction;
+        let adj_ray_origin = (Vec3A::from(self.p) - ray.origin) * ray.inv_direction;
+        let mut hit_mask = 0u32;
+
         unsafe {
-            // Step 1: Decode exponent scaling shared by all 8 children
-            // CWBVH: actual_bound = p + q_raw * scale, where scale = f32::from_bits(e << 23)
-            let scale_x = f32::from_bits((self.e[0] as u32) << 23);
-            let scale_y = f32::from_bits((self.e[1] as u32) << 23);
-            let scale_z = f32::from_bits((self.e[2] as u32) << 23);
-
-            let adj_ray_dir_inv = Vec3A::new(
-                scale_x * ray.inv_direction.x,
-                scale_y * ray.inv_direction.y,
-                scale_z * ray.inv_direction.z,
-            );
-            let adj_ray_origin = (Vec3A::from(self.p) - ray.origin) * ray.inv_direction;
-
-            // Broadcast to SIMD registers
             let inv_x = vdupq_n_f32(adj_ray_dir_inv.x);
             let inv_y = vdupq_n_f32(adj_ray_dir_inv.y);
             let inv_z = vdupq_n_f32(adj_ray_dir_inv.z);
@@ -135,189 +121,95 @@ impl CwBvhNode {
             let orig_y = vdupq_n_f32(adj_ray_origin.y);
             let orig_z = vdupq_n_f32(adj_ray_origin.z);
 
-            // Direction sign masks for vbsl: 0x0 or 0xFFFFFFFF per lane
-            let neg_x = vdupq_n_u32(if ray.direction.x < 0.0 { !0u32 } else { 0 });
-            let neg_y = vdupq_n_u32(if ray.direction.y < 0.0 { !0u32 } else { 0 });
-            let neg_z = vdupq_n_u32(if ray.direction.z < 0.0 { !0u32 } else { 0 });
+            let rdx = ray.direction.x < 0.0;
+            let rdy = ray.direction.y < 0.0;
+            let rdz = ray.direction.z < 0.0;
+
+            let tmin_clamp = vdupq_n_f32(EPSILON);
+            let tmax_clamp = vdupq_n_f32(ray.tmax);
 
             let (child_bits8, bit_index8) = self.get_child_and_index_bits(oct_inv4);
-            let mut hit_mask = 0u32;
 
-            // Step 2: Load all 8 child bounds at once, then split into two batches
+            // Let LLVM auto-vectorize u8->f32 widening — it produces better
+            // code than explicit vmovl_u8 -> vmovl_u16 -> vcvtq_f32_u32 chains.
+            #[inline(always)]
+            unsafe fn get_q(v: &[u8; 8], i: usize) -> float32x4_t {
+                unsafe {
+                    let base = i * 4;
+                    let f = [
+                        *v.get_unchecked(base) as f32,
+                        *v.get_unchecked(base + 1) as f32,
+                        *v.get_unchecked(base + 2) as f32,
+                        *v.get_unchecked(base + 3) as f32,
+                    ];
+                    vld1q_f32(f.as_ptr())
+                }
+            }
 
-            // X axis: load 8 bytes -> widen to u16x8 -> split -> widen to u32x4 -> convert to f32x4
-            let min_x_bytes = vld1_u8(self.child_min_x.as_ptr());
-            let max_x_bytes = vld1_u8(self.child_max_x.as_ptr());
-            let min_x_u16 = vmovl_u8(min_x_bytes);
-            let max_x_u16 = vmovl_u8(max_x_bytes);
-            let min_x_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(min_x_u16)));
-            let min_x_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(min_x_u16)));
-            let max_x_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(max_x_u16)));
-            let max_x_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(max_x_u16)));
+            // vshlq_u32 (1-cycle) instead of vmulq_u32 (3-cycle)
+            #[inline(always)]
+            unsafe fn movemask(cmp: uint32x4_t) -> u32 {
+                unsafe {
+                    let bits = vshrq_n_u32(cmp, 31);
+                    let shifted = vshlq_u32(bits, vld1q_s32([0i32, 1, 2, 3].as_ptr()));
+                    vaddvq_u32(shifted)
+                }
+            }
 
-            // Y axis (same pattern)
-            let min_y_bytes = vld1_u8(self.child_min_y.as_ptr());
-            let max_y_bytes = vld1_u8(self.child_max_y.as_ptr());
-            let min_y_u16 = vmovl_u8(min_y_bytes);
-            let max_y_u16 = vmovl_u8(max_y_bytes);
-            let min_y_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(min_y_u16)));
-            let min_y_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(min_y_u16)));
-            let max_y_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(max_y_u16)));
-            let max_y_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(max_y_u16)));
+            for i in 0..2 {
+                // Load near/far per axis — scalar branch is free, mask is lane-uniform
+                let q_lo_x = get_q(&self.child_min_x, i);
+                let q_hi_x = get_q(&self.child_max_x, i);
+                let (x_near, x_far) = if rdx {
+                    (q_hi_x, q_lo_x)
+                } else {
+                    (q_lo_x, q_hi_x)
+                };
 
-            // Z axis (same pattern)
-            let min_z_bytes = vld1_u8(self.child_min_z.as_ptr());
-            let max_z_bytes = vld1_u8(self.child_max_z.as_ptr());
-            let min_z_u16 = vmovl_u8(min_z_bytes);
-            let max_z_u16 = vmovl_u8(max_z_bytes);
-            let min_z_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(min_z_u16)));
-            let min_z_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(min_z_u16)));
-            let max_z_lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(max_z_u16)));
-            let max_z_hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(max_z_u16)));
+                let q_lo_y = get_q(&self.child_min_y, i);
+                let q_hi_y = get_q(&self.child_max_y, i);
+                let (y_near, y_far) = if rdy {
+                    (q_hi_y, q_lo_y)
+                } else {
+                    (q_lo_y, q_hi_y)
+                };
 
-            // Step 3: Process batch 0 (children 0-3)
-            process_batch_neon(
-                min_x_lo,
-                max_x_lo,
-                min_y_lo,
-                max_y_lo,
-                min_z_lo,
-                max_z_lo,
-                neg_x,
-                neg_y,
-                neg_z,
-                inv_x,
-                inv_y,
-                inv_z,
-                orig_x,
-                orig_y,
-                orig_z,
-                EPSILON,
-                ray.tmax,
-                std::mem::transmute(&child_bits8),
-                std::mem::transmute(&bit_index8),
-                0,
-                &mut hit_mask,
-            );
+                let q_lo_z = get_q(&self.child_min_z, i);
+                let q_hi_z = get_q(&self.child_max_z, i);
+                let (z_near, z_far) = if rdz {
+                    (q_hi_z, q_lo_z)
+                } else {
+                    (q_lo_z, q_hi_z)
+                };
 
-            // Step 4: Process batch 1 (children 4-7)
-            process_batch_neon(
-                min_x_hi,
-                max_x_hi,
-                min_y_hi,
-                max_y_hi,
-                min_z_hi,
-                max_z_hi,
-                neg_x,
-                neg_y,
-                neg_z,
-                inv_x,
-                inv_y,
-                inv_z,
-                orig_x,
-                orig_y,
-                orig_z,
-                EPSILON,
-                ray.tmax,
-                std::mem::transmute(&child_bits8),
-                std::mem::transmute(&bit_index8),
-                4,
-                &mut hit_mask,
-            );
+                let tmin_x = vfmaq_f32(orig_x, x_near, inv_x);
+                let tmax_x = vfmaq_f32(orig_x, x_far, inv_x);
+                let tmin_y = vfmaq_f32(orig_y, y_near, inv_y);
+                let tmax_y = vfmaq_f32(orig_y, y_far, inv_y);
+                let tmin_z = vfmaq_f32(orig_z, z_near, inv_z);
+                let tmax_z = vfmaq_f32(orig_z, z_far, inv_z);
 
-            hit_mask
+                // Plain max/min — 2-cycle latency vs 3-cycle for vmaxnmq/vminnmq.
+                // Safe here: quantized CWBVH bounds are never NaN.
+                let tmin = vmaxq_f32(tmin_x, vmaxq_f32(tmin_y, tmin_z));
+                let tmax = vminq_f32(tmax_x, vminq_f32(tmax_y, tmax_z));
+                let tmin = vmaxq_f32(tmin, tmin_clamp);
+                let tmax = vminq_f32(tmax, tmax_clamp);
+
+                let hit = vcleq_f32(tmin, tmax);
+                let mask = movemask(hit);
+
+                for j in 0..4 {
+                    if mask & (1 << j) != 0 {
+                        let offset = i * 4 + j;
+                        let cb = extract_byte64(child_bits8, offset) as u32;
+                        let bi = extract_byte64(bit_index8, offset) as u32;
+                        hit_mask |= cb << bi;
+                    }
+                }
+            }
         }
-    }
-}
 
-/// Process 4 children in NEON — fully unrolled, no loops
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-#[inline(always)]
-unsafe fn process_batch_neon(
-    x_min: float32x4_t,
-    x_max: float32x4_t,
-    y_min: float32x4_t,
-    y_max: float32x4_t,
-    z_min: float32x4_t,
-    z_max: float32x4_t,
-    neg_x: uint32x4_t,
-    neg_y: uint32x4_t,
-    neg_z: uint32x4_t,
-    inv_x: float32x4_t,
-    inv_y: float32x4_t,
-    inv_z: float32x4_t,
-    orig_x: float32x4_t,
-    orig_y: float32x4_t,
-    orig_z: float32x4_t,
-    ray_tmin: f32,
-    ray_tmax: f32, // ← explicit parameters
-    child_bits: &[u8; 8],
-    bit_index: &[u8; 8],
-    batch_offset: usize,
-    hit_mask: &mut u32,
-) {
-    unsafe {
-        // ARM-native predicate selection: vbsl is single-cycle, no branches
-        let x_min_sel = vbslq_f32(neg_x, x_max, x_min);
-        let x_max_sel = vbslq_f32(neg_x, x_min, x_max);
-        let y_min_sel = vbslq_f32(neg_y, y_max, y_min);
-        let y_max_sel = vbslq_f32(neg_y, y_min, y_max);
-        let z_min_sel = vbslq_f32(neg_z, z_max, z_min);
-        let z_max_sel = vbslq_f32(neg_z, z_min, z_max);
-
-        // FMA slab test: t = origin + bound * inv_dir (vfmaq = a + b*c)
-        let tmin_x = vfmaq_f32(orig_x, x_min_sel, inv_x);
-        let tmax_x = vfmaq_f32(orig_x, x_max_sel, inv_x);
-        let tmin_y = vfmaq_f32(orig_y, y_min_sel, inv_y);
-        let tmax_y = vfmaq_f32(orig_y, y_max_sel, inv_y);
-        let tmin_z = vfmaq_f32(orig_z, z_min_sel, inv_z);
-        let tmax_z = vfmaq_f32(orig_z, z_max_sel, inv_z);
-
-        // NaN-safe cross-axis reduction (important for axis-aligned/degenerate rays)
-        let tmin = vmaxnmq_f32(tmin_x, vmaxnmq_f32(tmin_y, tmin_z));
-        let tmax = vminnmq_f32(tmax_x, vminnmq_f32(tmax_y, tmax_z));
-
-        // Clamp to ray range (also NaN-safe)
-        let tmin = vmaxnmq_f32(tmin, vdupq_n_f32(ray_tmin));
-        let tmax = vminnmq_f32(tmax, vdupq_n_f32(ray_tmax));
-
-        // ARM-native bitmask extraction: shift -> weight -> horizontal add
-        let hit = vcleq_f32(tmin, tmax); // uint32x4_t: 0x0 or 0xFFFFFFFF per lane
-        let hit_mask_simd = movemask_u32x4(hit); // 4-bit mask: bits 0-3
-
-        // Unrolled scalar tail for metadata extraction
-        if hit_mask_simd & 0x1 != 0 {
-            let cb = child_bits[batch_offset + 0] as u32;
-            let bi = bit_index[batch_offset + 0] as u32;
-            *hit_mask |= cb << bi;
-        }
-        if hit_mask_simd & 0x2 != 0 {
-            let cb = child_bits[batch_offset + 1] as u32;
-            let bi = bit_index[batch_offset + 1] as u32;
-            *hit_mask |= cb << bi;
-        }
-        if hit_mask_simd & 0x4 != 0 {
-            let cb = child_bits[batch_offset + 2] as u32;
-            let bi = bit_index[batch_offset + 2] as u32;
-            *hit_mask |= cb << bi;
-        }
-        if hit_mask_simd & 0x8 != 0 {
-            let cb = child_bits[batch_offset + 3] as u32;
-            let bi = bit_index[batch_offset + 3] as u32;
-            *hit_mask |= cb << bi;
-        }
-    }
-}
-
-/// ARM-native: extract 4-bit mask from uint32x4_t comparison result
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-#[inline(always)]
-unsafe fn movemask_u32x4(cmp: uint32x4_t) -> u32 {
-    static BIT_POSITIONS: [u32; 4] = [1, 2, 4, 8];
-
-    unsafe {
-        let bits = vshrq_n_u32(cmp, 31);
-        let weighted = vmulq_u32(bits, vld1q_u32(BIT_POSITIONS.as_ptr()));
-        vaddvq_u32(weighted)
+        hit_mask
     }
 }
