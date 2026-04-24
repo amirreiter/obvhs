@@ -313,14 +313,11 @@ unsafe fn process_batch_neon(
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline(always)]
 unsafe fn movemask_u32x4(cmp: uint32x4_t) -> u32 {
-    unsafe {
-        static BIT_POSITIONS: [u32; 4] = [1, 2, 4, 8];
+    static BIT_POSITIONS: [u32; 4] = [1, 2, 4, 8];
 
-        // Shift MSB to LSB: 0xFFFFFFFF -> 0x1, 0x00000000 -> 0x0
+    unsafe {
         let bits = vshrq_n_u32(cmp, 31);
-        // AND with lane bit-positions [1, 2, 4, 8]
-        let weighted = vandq_u32(bits, vld1q_u32(BIT_POSITIONS.as_ptr()));
-        // Horizontal add: sum all 4 lanes into scalar result (single ARMv8.2+ instruction)
+        let weighted = vmulq_u32(bits, vld1q_u32(BIT_POSITIONS.as_ptr()));
         vaddvq_u32(weighted)
     }
 }
